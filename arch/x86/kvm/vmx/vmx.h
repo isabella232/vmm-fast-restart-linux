@@ -269,7 +269,7 @@ struct vcpu_vmx {
 	u32 exit_reason;
 
 	/* Posted interrupt descriptor */
-	struct pi_desc pi_desc;
+	struct pi_desc *pi_desc;
 
 	/* Support for a guest hypervisor (nested VMX) */
 	struct nested_vmx nested;
@@ -501,7 +501,7 @@ static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
 
 static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
 {
-	return &(to_vmx(vcpu)->pi_desc);
+	return to_vmx(vcpu)->pi_desc;
 }
 
 static inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
