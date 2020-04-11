@@ -99,6 +99,12 @@ struct irq_cfg {
 	unsigned int		vector;
 };
 
+static inline bool irq_alloc_type_is_msi(struct irq_alloc_info *info)
+{
+	return (info->type == X86_IRQ_ALLOC_TYPE_MSI ||
+		info->type == X86_IRQ_ALLOC_TYPE_MSIX);
+}
+
 extern struct irq_cfg *irq_cfg(unsigned int irq);
 extern struct irq_cfg *irqd_cfg(struct irq_data *irq_data);
 extern void lock_vector_lock(void);
