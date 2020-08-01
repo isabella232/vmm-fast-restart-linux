@@ -939,6 +939,108 @@ out:
 	spin_unlock_irqrestore(&iommu->lock, flags);
 }
 
+static int intel_iommu_get_map_regions(struct iommu_domain *idomain,
+				       struct list_head *head)
+{
+	struct dma_pte *parent[MAX_AGAW_PFN_WIDTH/LEVEL_STRIDE + 1], *pte;
+	unsigned long cur_iova_pfn, base_iova_pfn, max_iova_pfn;
+	struct dmar_domain *domain = to_dmar_domain(idomain);
+	int max_level = agaw_to_level(domain->agaw), level;
+	struct iommu_map_region *region;
+	unsigned long base_phys_pfn, next_phys_pfn;
+	int offset;
+	u64 prot;
+
+	BUG_ON(!domain->pgd);
+
+	INIT_LIST_HEAD(head);
+	level = max_level;
+	parent[level] = domain->pgd;
+	max_iova_pfn = DOMAIN_MAX_PFN(domain->gaw);
+	cur_iova_pfn = 0;
+	while (1) {
+		while (cur_iova_pfn <= max_iova_pfn) {
+			offset = pfn_level_offset(cur_iova_pfn, level);
+			pte = &parent[level][offset];
+
+			if (dma_pte_present(pte)) {
+				if (dma_pte_superpage(pte) || level == 1)
+					break;
+
+				/* need to dive into lower level */
+				level--;
+				parent[level] = phys_to_virt(dma_pte_addr(pte));
+				continue;
+			}
+
+			/* !dma_pte_present(pte) */
+			cur_iova_pfn += level_size(level);
+			if (offset + 1 >= VTD_PAGE_SIZE/sizeof(*pte))
+				level = max_level;
+		}
+		if (cur_iova_pfn >= max_iova_pfn)
+			break;
+
+		base_iova_pfn = cur_iova_pfn;
+		base_phys_pfn = next_phys_pfn = dma_pte_addr(pte) >> PAGE_SHIFT;
+		prot = dma_pte_attr(pte) & (DMA_PTE_READ | DMA_PTE_WRITE);
+
+		while (cur_iova_pfn <= max_iova_pfn) {
+			unsigned long cur_phys_pfn;
+			u64 cur_prot;
+
+			offset = pfn_level_offset(cur_iova_pfn, level);
+			pte = &parent[level][offset];
+
+			if (!dma_pte_present(pte))
+				break;
+
+			/*  dma_pte_present(pte) */
+
+			if (dma_pte_superpage(pte) || level == 1) {
+				cur_prot = dma_pte_attr(pte) & (DMA_PTE_READ | DMA_PTE_WRITE);
+				cur_phys_pfn = dma_pte_addr(pte) >> PAGE_SHIFT;
+				if (cur_prot != prot || cur_phys_pfn != next_phys_pfn)
+					break;
+
+				cur_iova_pfn += level_size(level);
+				next_phys_pfn += level_size(level) >> (PAGE_SHIFT - VTD_PAGE_SHIFT);
+
+				if (offset + 1 >= VTD_PAGE_SIZE/sizeof(*pte))
+					level = max_level;
+				continue;
+			}
+
+			/* need to dive into lower level */
+			level--;
+			parent[level] = phys_to_virt(dma_pte_addr(pte));
+		}
+
+		if (cur_iova_pfn > base_iova_pfn) {
+			region = kmalloc(sizeof(*region), GFP_KERNEL);
+			if (!region)
+				goto err_free_list;
+			region->iova = base_iova_pfn << VTD_PAGE_SHIFT;
+			region->phys = base_phys_pfn << PAGE_SHIFT;
+			region->size = (cur_iova_pfn - base_iova_pfn) << VTD_PAGE_SHIFT;
+			region->prot = prot;
+			list_add_tail(&region->list, head);
+		}
+
+		if (cur_iova_pfn > max_iova_pfn)
+			break;
+	}
+
+	return 0;
+err_free_list:
+	while (!list_empty(head)) {
+		region = list_first_entry(head, struct iommu_map_region, list);
+		list_del(&region->list);
+		kfree(region);
+	}
+	return -ENOMEM;
+}
+
 static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
 				      unsigned long pfn, int *target_level)
 {
@@ -6063,6 +6165,7 @@ const struct iommu_ops intel_iommu_ops = {
 	.map			= intel_iommu_map,
 	.unmap			= intel_iommu_unmap,
 	.iova_to_phys		= intel_iommu_iova_to_phys,
+	.get_map_regions	= intel_iommu_get_map_regions,
 	.probe_device		= intel_iommu_probe_device,
 	.probe_finalize		= intel_iommu_probe_finalize,
 	.release_device		= intel_iommu_release_device,

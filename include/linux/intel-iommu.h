@@ -681,6 +681,11 @@ static inline bool dma_pte_superpage(struct dma_pte *pte)
 	return (pte->val & DMA_PTE_LARGE_PAGE);
 }
 
+static inline u64 dma_pte_attr(struct dma_pte *pte)
+{
+	return (pte->val & ~VTD_PAGE_MASK);
+}
+
 static inline int first_pte_in_page(struct dma_pte *pte)
 {
 	return !((unsigned long)pte & ~VTD_PAGE_MASK);
