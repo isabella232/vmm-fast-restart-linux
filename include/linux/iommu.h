@@ -157,6 +157,14 @@ struct iommu_resv_region {
 	enum iommu_resv_type	type;
 };
 
+struct iommu_map_region {
+	struct list_head list;
+	unsigned long iova;
+	unsigned long phys;
+	size_t size;
+	int prot;
+};
+
 /* Per device IOMMU features */
 enum iommu_dev_features {
 	IOMMU_DEV_FEAT_AUX,	/* Aux-domain feature */
@@ -250,6 +258,8 @@ struct iommu_ops {
 	void (*iotlb_sync)(struct iommu_domain *domain,
 			   struct iommu_iotlb_gather *iotlb_gather);
 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain, dma_addr_t iova);
+	int (*get_map_regions)(struct iommu_domain *domain,
+			       struct list_head *list);
 	struct iommu_device *(*probe_device)(struct device *dev);
 	void (*release_device)(struct device *dev);
 	void (*probe_finalize)(struct device *dev);
@@ -452,6 +462,8 @@ extern size_t iommu_map_sg_atomic(struct iommu_domain *domain,
 extern phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova);
 extern void iommu_set_fault_handler(struct iommu_domain *domain,
 			iommu_fault_handler_t handler, void *token);
+extern int iommu_get_map_regions(struct iommu_domain *domain,
+				 struct list_head *head);
 
 extern void iommu_get_resv_regions(struct device *dev, struct list_head *list);
 extern void iommu_put_resv_regions(struct device *dev, struct list_head *list);

@@ -2138,6 +2138,14 @@ void iommu_detach_group(struct iommu_domain *domain, struct iommu_group *group)
 }
 EXPORT_SYMBOL_GPL(iommu_detach_group);
 
+int iommu_get_map_regions(struct iommu_domain *domain, struct list_head *head)
+{
+	if (domain->ops->get_map_regions == NULL)
+		return -ENOTSUPP;
+	return domain->ops->get_map_regions(domain, head);
+}
+EXPORT_SYMBOL_GPL(iommu_get_map_regions);
+
 phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
 	if (unlikely(domain->ops->iova_to_phys == NULL))
