@@ -3117,6 +3117,163 @@ static int vfio_iommu_keepalive_replay(struct vfio_iommu *iommu)
 	return 0;
 }
 
+static void map_region_list_free(struct list_head *head)
+{
+	struct iommu_map_region *map;
+
+	while (!list_empty(head)) {
+		map = list_first_entry(head, struct iommu_map_region, list);
+		list_del(&map->list);
+		kfree(map);
+	}
+}
+
+static int __dma_get_mm_map_list(struct vfio_dma *dma, struct list_head *head)
+{
+	dma_addr_t iova = dma->iova, end = iova + dma->size;
+	unsigned long vaddr = dma->vaddr;
+	struct iommu_map_region *map;
+	int ret;
+
+	if (!current->mm)
+		return -ENODEV;
+
+	while (iova < end) {
+		unsigned long pfn, next;
+		size_t len;
+
+		ret = vaddr_get_pfn(current->mm, vaddr, dma->prot, &pfn);
+		if (ret)
+			return ret;
+
+		if (!is_invalid_reserved_pfn(pfn))
+			put_pfn(pfn, dma->prot);
+
+		for (len = PAGE_SIZE; iova + len < end; len += PAGE_SIZE) {
+			ret = vaddr_get_pfn(current->mm, vaddr + len,
+					    dma->prot, &next);
+			if (ret)
+				return ret;
+
+			if (!is_invalid_reserved_pfn(next))
+				put_pfn(next, dma->prot);
+
+			if (next != pfn + (len >> PAGE_SHIFT))
+				break;
+		}
+
+		map = kzalloc(sizeof(*map), GFP_KERNEL);
+		if (!map)
+			return -ENOMEM;
+		map->iova = iova;
+		map->phys = pfn << PAGE_SHIFT;
+		map->prot = dma->prot & (IOMMU_READ | IOMMU_WRITE);
+		map->size = len;
+
+		list_add_tail(&map->list, head);
+
+		iova += len;
+		vaddr += len;
+	}
+	return 0;
+}
+
+static int build_vfio_map_list(struct vfio_iommu *iommu,
+			       struct list_head *map_head)
+{
+	struct rb_node *n;
+	int ret;
+
+	n = rb_first(&iommu->dma_list);
+	for (; n; n = rb_next(n)) {
+		struct vfio_dma *dma;
+
+		dma = rb_entry(n, struct vfio_dma, node);
+
+		if (!(dma->prot & IOMMU_KEEPALIVE))
+			continue;
+
+		ret = __dma_get_mm_map_list(dma, map_head);
+		if (ret)
+			goto free_mm_map_list;
+	}
+	return 0;
+free_mm_map_list:
+	map_region_list_free(map_head);
+	return ret;
+}
+
+static int build_iommu_map_list(struct vfio_iommu *iommu,
+				struct list_head *map_head)
+{
+	struct vfio_domain *domain;
+
+	domain = list_first_entry(&iommu->domain_list, struct vfio_domain, next);
+	if (!domain)
+		return -ENOENT;
+
+	return iommu_get_map_regions(domain->domain, map_head);
+}
+
+static bool dma_map_equal(struct iommu_map_region *cur,
+			  struct iommu_map_region *old)
+{
+	return cur->iova == old->iova &&
+	       cur->size == old->size &&
+	       cur->prot == old->prot;
+}
+
+static int vfio_validate_dma_map_list(struct list_head *vfio_map_list,
+				      struct list_head *iommu_map_list)
+{
+	struct iommu_map_region *cur, *old;
+
+	if (list_empty(vfio_map_list) && !list_empty(iommu_map_list)) {
+		pr_warn("current dma mapping list is empty, while saved is not\n");
+		return -EINVAL;
+	}
+
+	old = list_first_entry(iommu_map_list, struct iommu_map_region, list);
+	list_for_each_entry(cur, vfio_map_list, list) {
+		if (&old->list == iommu_map_list) {
+			pr_warn("current dma mapping list size is more than saved\n");
+			return -EINVAL;
+		}
+		if (!dma_map_equal(cur, old)) {
+			pr_warn("dma map mismatch\n");
+			return -EINVAL;
+		}
+		old = list_next_entry(old, list);
+	}
+	if (&old->list != iommu_map_list) {
+		pr_warn("current dma mapping list size is more than saved\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int vfio_iommu_validate_dma_maps(struct vfio_iommu *iommu)
+{
+	struct list_head vfio_map_list, iommu_map_list;
+	int ret;
+
+	INIT_LIST_HEAD(&vfio_map_list);
+	INIT_LIST_HEAD(&iommu_map_list);
+	ret = build_vfio_map_list(iommu, &vfio_map_list);
+	if (ret)
+		return ret;
+	ret = build_iommu_map_list(iommu, &iommu_map_list);
+	if (ret)
+		goto free_list;
+
+	ret = vfio_validate_dma_map_list(&vfio_map_list, &iommu_map_list);
+free_list:
+	map_region_list_free(&vfio_map_list);
+	map_region_list_free(&iommu_map_list);
+	return ret;
+}
+
 static int vfio_iommu_type1_set_keepalive(void *iommu_data,
 					  struct vfio_keepalive_data *vka)
 {
@@ -3126,6 +3283,12 @@ static int vfio_iommu_type1_set_keepalive(void *iommu_data,
 	mutex_lock(&iommu->lock);
 
 	if (!vka->keepalive && iommu->keepalive) {
+		ret = vfio_iommu_validate_dma_maps(iommu);
+		if (ret) {
+			pr_warn("keepalive: dma_maps mismatch\n");
+			goto iommu_keepalive_unlock;
+		}
+
 		ret = vfio_iommu_keepalive_replay(iommu);
 		if (ret) {
 			pr_warn("keepalive: failed to replay DMA mappings\n");
