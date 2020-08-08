@@ -6956,6 +6956,28 @@ static bool pid_page_empty(struct page *page)
 	return num >= PAGE_PI_DESC_BITS;
 }
 
+static void pid_page_keepalive_get(struct page *page)
+{
+	get_page(page);
+	page->private++;
+}
+
+static void pid_page_keepalive_put(struct page *page)
+{
+	page->private--;
+	put_page(page);
+}
+
+static bool pid_page_is_keepalive(struct page *page)
+{
+	return page->private != 0;
+}
+
+static bool pid_page_lru_linked(struct page *page)
+{
+	return !list_empty(&page->lru);
+}
+
 static void vmx_init_pi_desc(struct kvm *kvm)
 {
 	struct kvm_vmx *kv = to_kvm_vmx(kvm);
@@ -7022,6 +7044,68 @@ static void vmx_vcpu_free_pi_desc(struct kvm_vcpu *vcpu)
 	__vmx_vcpu_free_pi_desc(vmx);
 
 	mutex_unlock(&kv->pid_page_lock);
+}
+
+static int vmx_vcpu_save_pi_desc(struct kvm_vcpu *vcpu, void **data)
+{
+	struct kvm_vmx *kv = to_kvm_vmx(vcpu->kvm);
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct page *page;
+
+	mutex_lock(&kv->pid_page_lock);
+
+	pi_set_sn(vmx->pi_desc);
+
+	page = virt_to_page((unsigned long)vmx->pi_desc & PAGE_MASK);
+	pid_page_keepalive_get(page);
+	*data = vmx->pi_desc;
+
+	mutex_unlock(&kv->pid_page_lock);
+	return 0;
+}
+
+static void vmx_vcpu_load_pi_desc(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int cpu;
+
+	cpu = get_cpu();
+	vmx_vcpu_load(vcpu, cpu);
+	if (kvm_vcpu_apicv_active(vcpu))
+		vmcs_write64(POSTED_INTR_DESC_ADDR, __pa((vmx->pi_desc)));
+	vmx_vcpu_put(vcpu);
+	put_cpu();
+}
+
+static int vmx_vcpu_restore_pi_desc(struct kvm_vcpu *vcpu, void **data)
+{
+	struct kvm_vmx *kv = to_kvm_vmx(vcpu->kvm);
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct pi_desc *pi_desc = *data;
+	struct page *page;
+	int num;
+
+	page = virt_to_page((unsigned long)pi_desc & PAGE_MASK);
+	num = ((unsigned long)pi_desc & ~PAGE_MASK) / sizeof(struct pi_desc);
+
+	mutex_lock(&kv->pid_page_lock);
+
+	if (vmx->pi_desc != pi_desc) {
+		__vmx_vcpu_free_pi_desc(vmx);
+		vmx->pi_desc = pi_desc;
+		get_page(page);
+	}
+
+	pid_page_set_bit(page, num);
+	if (!pid_page_is_keepalive(page) && !pid_page_lru_linked(page))
+		list_add(&page->lru, &kv->pid_page_head);
+	pid_page_keepalive_put(page);
+
+	mutex_unlock(&kv->pid_page_lock);
+
+	vmx_vcpu_load_pi_desc(vcpu);
+
+	return 0;
 }
 
 static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
@@ -7907,6 +7991,56 @@ out:
 	return ret;
 }
 
+static int vmx_do_keepalive_pi(struct kvm *kvm, int guest_irq,
+			    void **data, bool save)
+{
+	struct kvm_kernel_irq_routing_entry *e;
+	struct kvm_irq_routing_table *irq_rt;
+	struct kvm_lapic_irq irq;
+	struct kvm_vcpu *vcpu;
+	int idx, ret = 0;
+
+	if (!kvm_arch_has_assigned_device(kvm) ||
+		!irq_remapping_cap(IRQ_POSTING_CAP) ||
+		!kvm_vcpu_apicv_active(kvm->vcpus[0]))
+		return -ENOENT;
+
+	idx = srcu_read_lock(&kvm->irq_srcu);
+	irq_rt = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
+	if (guest_irq >= irq_rt->nr_rt_entries ||
+	    hlist_empty(&irq_rt->map[guest_irq])) {
+		pr_warn_once("no route for guest_irq %u/%u (broken user space?)\n",
+			     guest_irq, irq_rt->nr_rt_entries);
+		ret = -ENOENT;
+		goto out;
+	}
+
+	hlist_for_each_entry(e, &irq_rt->map[guest_irq], link) {
+		if (e->type != KVM_IRQ_ROUTING_MSI)
+			continue;
+		kvm_set_msi_irq(kvm, e, &irq);
+		if (!kvm_intr_is_single_vcpu(kvm, &irq, &vcpu)) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (save)
+			ret = vmx_vcpu_save_pi_desc(vcpu, data);
+		else
+			ret = vmx_vcpu_restore_pi_desc(vcpu, data);
+		if (ret < 0) {
+			printk(KERN_INFO "%s: failed to %s PID\n",
+					__func__, save ? "save" : "restore");
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	srcu_read_unlock(&kvm->irq_srcu, idx);
+	return ret;
+}
+
 static void vmx_setup_mce(struct kvm_vcpu *vcpu)
 {
 	if (vcpu->arch.mcg_cap & MCG_LMCE_P)
@@ -8126,6 +8260,7 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
 	.need_emulation_on_page_fault = vmx_need_emulation_on_page_fault,
 	.apic_init_signal_blocked = vmx_apic_init_signal_blocked,
 	.migrate_timers = vmx_migrate_timers,
+	.do_keepalive_pi = vmx_do_keepalive_pi,
 };
 
 static __init int hardware_setup(void)
