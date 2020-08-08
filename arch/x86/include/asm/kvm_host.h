@@ -1227,6 +1227,8 @@ struct kvm_x86_ops {
 	int (*enable_direct_tlbflush)(struct kvm_vcpu *vcpu);
 
 	void (*migrate_timers)(struct kvm_vcpu *vcpu);
+
+	int (*do_keepalive_pi)(struct kvm *kvm, int guest_irq, void **data, bool save);
 };
 
 struct kvm_x86_nested_ops {
