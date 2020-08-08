@@ -6916,6 +6916,114 @@ reenter_guest:
 	return exit_fastpath;
 }
 
+#define PAGE_PI_DESC_BITS (PAGE_SIZE/sizeof(struct pi_desc))
+
+static void pid_page_prepare(struct page *page)
+{
+	page->mapping = NULL;
+	page->index = 0;
+	page->private = 0;
+	INIT_LIST_HEAD(&page->lru);
+}
+
+static int pid_page_find_zero_bit(struct page *page)
+{
+	unsigned long *pi_desc_bitmap = (unsigned long *)&page->mapping;
+
+	return find_first_zero_bit(pi_desc_bitmap, PAGE_PI_DESC_BITS);
+}
+
+static void pid_page_set_bit(struct page *page, int num)
+{
+	unsigned long *pi_desc_bitmap = (unsigned long *)&page->mapping;
+
+	set_bit(num, pi_desc_bitmap);
+}
+
+static void pid_page_clear_bit(struct page *page, int num)
+{
+	unsigned long *pi_desc_bitmap = (unsigned long *)&page->mapping;
+
+	clear_bit(num, pi_desc_bitmap);
+}
+
+static bool pid_page_empty(struct page *page)
+{
+	unsigned long *pi_desc_bitmap = (unsigned long *)&page->mapping;
+	int num;
+
+	num = find_first_bit(pi_desc_bitmap, PAGE_PI_DESC_BITS);
+	return num >= PAGE_PI_DESC_BITS;
+}
+
+static void vmx_init_pi_desc(struct kvm *kvm)
+{
+	struct kvm_vmx *kv = to_kvm_vmx(kvm);
+
+	mutex_init(&kv->pid_page_lock);
+	INIT_LIST_HEAD(&kv->pid_page_head);
+}
+
+static int vmx_vcpu_alloc_pi_desc(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmx *kv = to_kvm_vmx(vcpu->kvm);
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct page *page;
+	int num;
+
+	mutex_lock(&kv->pid_page_lock);
+
+	list_for_each_entry(page, &kv->pid_page_head, lru) {
+		num = pid_page_find_zero_bit(page);
+		if (num < PAGE_PI_DESC_BITS) {
+			get_page(page);
+			goto found_pid;
+		}
+	}
+
+	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!page) {
+		mutex_unlock(&kv->pid_page_lock);
+		return -ENOMEM;
+	}
+	pid_page_prepare(page);
+	list_add(&page->lru, &kv->pid_page_head);
+	num = 0;
+found_pid:
+	pid_page_set_bit(page, num);
+	vmx->pi_desc = page_to_virt(page) + num * sizeof(struct pi_desc);
+	mutex_unlock(&kv->pid_page_lock);
+	return 0;
+}
+
+static void __vmx_vcpu_free_pi_desc(struct vcpu_vmx *vmx)
+{
+	struct page *page;
+	int num;
+
+	page = virt_to_page((unsigned long)vmx->pi_desc & PAGE_MASK);
+	num = ((unsigned long)vmx->pi_desc & ~PAGE_MASK) / sizeof(struct pi_desc);
+
+	pid_page_clear_bit(page, num);
+	if (pid_page_empty(page)) {
+		list_del(&page->lru);
+		INIT_LIST_HEAD(&page->lru);
+	}
+	put_page(page);
+}
+
+static void vmx_vcpu_free_pi_desc(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmx *kv = to_kvm_vmx(vcpu->kvm);
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	mutex_lock(&kv->pid_page_lock);
+
+	__vmx_vcpu_free_pi_desc(vmx);
+
+	mutex_unlock(&kv->pid_page_lock);
+}
+
 static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -6925,7 +7033,7 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
 	free_vpid(vmx->vpid);
 	nested_vmx_free_vcpu(vcpu);
 	free_loaded_vmcs(vmx->loaded_vmcs);
-	free_page((unsigned long)vmx->pi_desc);
+	vmx_vcpu_free_pi_desc(vcpu);
 }
 
 static int vmx_create_vcpu(struct kvm_vcpu *vcpu)
@@ -6933,18 +7041,15 @@ static int vmx_create_vcpu(struct kvm_vcpu *vcpu)
 	struct vcpu_vmx *vmx;
 	unsigned long *msr_bitmap;
 	int i, cpu, err;
-	struct page *page;
 
 	BUILD_BUG_ON(offsetof(struct vcpu_vmx, vcpu) != 0);
 	vmx = to_vmx(vcpu);
 
-	err = -ENOMEM;
-
-	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
-	if (!page)
+	err = vmx_vcpu_alloc_pi_desc(vcpu);
+	if (err)
 		return err;
-	vmx->pi_desc = page_address(page);
 
+	err = -ENOMEM;
 	vmx->vpid = allocate_vpid();
 
 	/*
@@ -7057,8 +7162,7 @@ free_pml:
 	vmx_destroy_pml_buffer(vmx);
 free_vpid:
 	free_vpid(vmx->vpid);
-	free_page((unsigned long)vmx->pi_desc);
-	vmx->pi_desc = NULL;
+	vmx_vcpu_free_pi_desc(vcpu);
 	return err;
 }
 
@@ -7068,6 +7172,7 @@ free_vpid:
 static int vmx_vm_init(struct kvm *kvm)
 {
 	spin_lock_init(&to_kvm_vmx(kvm)->ept_pointer_lock);
+	vmx_init_pi_desc(kvm);
 
 	if (!ple_gap)
 		kvm->arch.pause_in_guest = true;
