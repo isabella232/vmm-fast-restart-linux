@@ -1174,6 +1174,7 @@ static long vfio_ioctl_set_keepalive(struct vfio_container *container,
 {
 	struct vfio_group *group;
 	struct vfio_device *device;
+	struct vfio_iommu_driver *driver;
 	struct vfio_keepalive_data vka;
 	int ret;
 
@@ -1196,6 +1197,16 @@ static long vfio_ioctl_set_keepalive(struct vfio_container *container,
 	}
 	up_write(&container->group_lock);
 
+	mutex_lock(&vfio.iommu_drivers_lock);
+	driver = container->iommu_driver;
+	if (!driver->ops->set_keepalive) {
+		ret = -ENOTSUPP;
+		goto unwind_dev;
+	}
+	ret = driver->ops->set_keepalive(container->iommu_data, &vka);
+	if (ret)
+		goto unwind_dev;
+	mutex_unlock(&vfio.iommu_drivers_lock);
 	return 0;
 unwind_dev:
 	vka.keepalive = !vka.keepalive;
